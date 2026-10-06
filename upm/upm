@@ -1,0 +1,227 @@
+#!/bin/sh
+# Minimal but robust UPM CLI
+# Path: /mnt/us/upm/bin/upm
+
+# Configuration
+MOD_BASE_RAW="https://raw.githubusercontent.com/easy-123456789/upm/refs/heads/main/mods"
+INDEX_URL="$MOD_BASE_RAW/index.json"
+MOD_DIR="/mnt/us/upm/mods"
+TMP_DIR="/mnt/us/upm/tmp"
+COMPILER="/mnt/us/upm/compiler/compile.sh"
+
+# Ensure runtime dirs
+mkdir -p "$MOD_DIR" "$TMP_DIR"
+
+log() {
+  printf "[upm] %s\n" "$*"
+}
+
+download_file() {
+  url="$1"; out="$2"
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -O "$out" "$url" && return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -sL "$url" -o "$out" && return 0
+  fi
+  return 1
+}
+
+# Allow only safe mod names (alnum, -, _)
+sanitize_mod_name() {
+  echo "$1" | sed -n 's/[^A-Za-z0-9._-]//g;p'
+}
+
+download_mod_files() {
+  mod="$1"
+  dest="$MOD_DIR/$mod"
+  mkdir -p "$dest"
+  for f in details.json install.sh uninstall.sh launch.sh; do
+    url="$MOD_BASE_RAW/$mod/$f"
+    out="$dest/$f"
+    download_file "$url" "$out" || true
+  done
+  chmod +x "$dest"/*.sh 2>/dev/null || true
+}
+
+cmd_install() {
+  mod_raw="$1"
+  if [ -z "$mod_raw" ]; then
+    log "Usage: upm install <mod-name>"
+    return 1
+  fi
+  mod="$(sanitize_mod_name "$mod_raw")"
+  if [ -z "$mod" ]; then
+    log "Invalid mod name"
+    return 1
+  fi
+  log "Installing $mod..."
+  download_mod_files "$mod"
+  if [ -x "$MOD_DIR/$mod/install.sh" ]; then
+    sh "$MOD_DIR/$mod/install.sh"
+  else
+    log "No install script found for $mod (files downloaded to $MOD_DIR/$mod)"
+  fi
+  log "Install finished for $mod"
+}
+
+cmd_install_url() {
+  url="$1"
+  if [ -z "$url" ]; then
+    log "Usage: upm install-url <git-url>"
+    return 1
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    log "git not available on device"
+    return 1
+  fi
+  tmp="$(mktemp -d "$TMP_DIR/upm_clone.XXXX")"
+  if ! git clone --depth 1 "$url" "$tmp" >/dev/null 2>&1; then
+    log "git clone failed"
+    rm -rf "$tmp"
+    return 1
+  fi
+  name="$(basename "$url" .git)"
+  name="$(sanitize_mod_name "$name")"
+  dest="$MOD_DIR/$name"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -r "$tmp/"* "$dest/" 2>/dev/null || true
+  chmod +x "$dest"/*.sh 2>/dev/null || true
+  if [ -x "$dest/install.sh" ]; then
+    sh "$dest/install.sh"
+  fi
+  rm -rf "$tmp"
+  log "Installed from URL into $dest"
+}
+
+cmd_remove() {
+  mod_raw="$1"
+  if [ -z "$mod_raw" ]; then
+    log "Usage: upm remove <mod-name>"
+    return 1
+  fi
+  mod="$(sanitize_mod_name "$mod_raw")"
+  path="$MOD_DIR/$mod"
+  if [ ! -d "$path" ]; then
+    log "Mod not installed: $mod"
+    return 1
+  fi
+  if [ -x "$path/uninstall.sh" ]; then
+    sh "$path/uninstall.sh"
+  fi
+  rm -rf "$path"
+  log "Removed $mod"
+}
+
+cmd_list() {
+  echo "Installed mods:"
+  for d in "$MOD_DIR"/*; do
+    [ -d "$d" ] || continue
+    echo " - $(basename "$d")"
+  done
+}
+
+cmd_launch() {
+  mod_raw="$1"
+  if [ -z "$mod_raw" ]; then
+    log "Usage: upm launch <mod-name>"
+    return 1
+  fi
+  mod="$(sanitize_mod_name "$mod_raw")"
+  script="$MOD_DIR/$mod/launch.sh"
+  if [ -x "$script" ]; then
+    sh "$script"
+  else
+    log "No launch script for $mod"
+    return 1
+  fi
+}
+
+cmd_search() {
+  query="$1"
+  if [ -z "$query" ]; then
+    log "Usage: upm search <query>"
+    return 1
+  fi
+  idx="$TMP_DIR/index.json"
+  if download_file "$INDEX_URL" "$idx"; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -r --arg q "$query" '.mods[] | select((.name + " " + (.description // "")) | ascii_downcase | contains($q|ascii_downcase)) | "\(.name) \(.version) - \(.description)"' "$idx" 2>/dev/null || echo "No matches"
+    else
+      grep -i "$query" "$idx" || echo "No matches (install jq for better search)"
+    fi
+  else
+    log "No index available"
+    return 1
+  fi
+}
+
+read_local_version() {
+  mod="$1"
+  details="$MOD_DIR/$mod/details.json"
+  if [ -f "$details" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.version // empty' "$details" 2>/dev/null
+  else
+    echo ""
+  fi
+}
+
+cmd_update() {
+  idx="$TMP_DIR/index.json"
+  if download_file "$INDEX_URL" "$idx"; then
+    if command -v jq >/dev/null 2>&1; then
+      for name in $(jq -r '.mods[].name' "$idx" 2>/dev/null); do
+        remote_ver=$(jq -r ".mods[] | select(.name==\"$name\") | .version" "$idx" 2>/dev/null)
+        local_ver="$(read_local_version "$name")"
+        if [ -n "$local_ver" ] && [ -n "$remote_ver" ] && [ "$local_ver" != "$remote_ver" ]; then
+          log "Updating $name: $local_ver -> $remote_ver"
+          download_mod_files "$name"
+        fi
+      done
+    else
+      log "jq not available; falling back to refreshing installed mods"
+      for d in "$MOD_DIR"/*; do
+        [ -d "$d" ] || continue
+        name="$(basename "$d")"
+        log "Refreshing $name"
+        download_mod_files "$name"
+      done
+    fi
+  else
+    log "Index not available; refreshing all installed mods"
+    for d in "$MOD_DIR"/*; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      log "Refreshing $name"
+      download_mod_files "$name"
+    done
+  fi
+}
+
+cmd_compile() {
+  src="$1"
+  if [ -z "$src" ]; then
+    log "Usage: upm compile <source>"
+    return 1
+  fi
+  if [ -x "$COMPILER" ]; then
+    sh "$COMPILER" "$src"
+  else
+    log "Compiler not found: $COMPILER"
+    return 1
+  fi
+}
+
+# Router
+case "$1" in
+  install) shift; cmd_install "$@" ;;
+  install-url) shift; cmd_install_url "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  list) cmd_list ;;
+  launch) shift; cmd_launch "$@" ;;
+  search) shift; cmd_search "$@" ;;
+  update) cmd_update ;;
+  compile) shift; cmd_compile "$@" ;;
+  *) echo "Usage: upm {install|install-url|remove|list|launch|search|update|compile}"; exit 1 ;;
+esac
