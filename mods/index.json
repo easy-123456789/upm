@@ -1,0 +1,11 @@
+{
+  "mods": [
+    {
+      "name": "vnc",
+      "version": "1.0.0",
+      "author": "easy-123456789",
+      "description": "Launch a VNC server on the Kindle and connect from a desktop viewer.",
+      "source": "https://github.com/easy-123456789/upm"
+    }
+  ]
+}
